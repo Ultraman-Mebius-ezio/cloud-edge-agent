@@ -1,0 +1,32 @@
+# ── 论文原文（仅本地保存，不纳入版本管理） ──
+papers/
+
+# ── 工作笔记、草稿、历史版本（仅本地保存） ──
+notes/
+
+# ── 工具输出 ──
+.playwright-mcp/
+
+# ── 系统 / 编辑器文件 ──
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ── Python（原型开发用） ──
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# ── 运行产物（指标库每次实验都在长，不能入库） ──
+runs/
+
+# ── 数据与模型权重（体积大，不入库） ──
+data/
+models/
+*.gguf
+*.safetensors

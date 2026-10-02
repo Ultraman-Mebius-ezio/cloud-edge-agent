@@ -1,0 +1,7 @@
+# 统一行尾。仓库内存 LF，检出时按平台转换——
+# 否则 Windows 成员的编辑器会把整个文件标成改动，diff 全是噪音。
+* text=auto
+
+*.png binary
+*.jpg binary
+*.zip binary
