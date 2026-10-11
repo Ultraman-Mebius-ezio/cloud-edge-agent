@@ -135,6 +135,20 @@ def _preview(text: str) -> str:
     return flat[:PREVIEW_CHARS] + "…"
 
 
+def is_single_step_arithmetic(text: str) -> bool:
+    """对外暴露「整句是否只是一个算式」的判定。
+
+    gate 用它拦掉单步算术：一个算式就能答完的请求，拆解只会平白多付
+    分解与汇聚两次云端调用（v1 实测每请求最少 842 云端 token）。
+    """
+    return _is_pure_arithmetic(text)
+
+
+def matched_open_word(text: str) -> str | None:
+    """对外暴露「命中的第一个开放词」。gate 用它识别主观/开放式提问。"""
+    return _matched_open_word(text)
+
+
 def allocate_one(text: str) -> str:
     """判定**整条请求**的档位，返回 "local" | "cloud"。
 

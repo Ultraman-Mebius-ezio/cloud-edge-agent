@@ -31,7 +31,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from . import allocator, aggregator, config, metrics, planner, runner
+from . import allocator, aggregator, config, gate, metrics, planner, runner
 from .llm_client import call_llm, warmup
 
 # ---------------------------------------------------------------------------
@@ -245,8 +245,45 @@ def _direct_impl(
 def answer_dot(
     question: str, task_id: str, run_id: str
 ) -> tuple[str, list[runner.SubtaskResult]]:
-    """dot 主方案：分解 → 分配 → 顺序执行 → 汇聚。"""
+    """dot 主方案：闸门 → (拦下则整请求直答) / (放行则 分解 → 分配 → 顺序执行 → 汇聚)。
+
+    闸门放行时返回子任务结果列表；**被拦下时返回空列表**——调用方据此知道
+    本次没走流水线（`_print_dot_plan` 对空列表会直接返回，不会误画空表）。
+    """
     t0 = time.perf_counter()
+
+    need_decompose, gate_reason = gate.should_decompose(question)
+    if not need_decompose:
+        # 闸门拦下：单步或开放题，拆解只会平白多付分解 + 汇聚两次云端调用。
+        # 走与 direct 相同的整请求规则路由——**同一套 allocator 规则**，
+        # 保证「拦下之后的行为」与对照臂完全一致，差别只在拆不拆。
+        tier = allocator.allocate_one(question)
+        result = call_llm(
+            messages=_build_messages(question, None),
+            role="executor",
+            tier=tier,
+            strategy="dot",
+            task_id=task_id,
+            run_id=run_id,
+            retries=EXEC_RETRIES,
+        )
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        _record_task(
+            strategy="dot",
+            task_id=task_id,
+            run_id=run_id,
+            question=question,
+            answer=result.text,
+            results=None,
+            total_ms=total_ms,
+            plan_ms=0.0,
+            exec_ms=result.latency_ms,
+            gated=1,
+            gate_reason=gate_reason,
+            error=result.error,
+        )
+        console.print(f"[dim]闸门拦下（{escape(gate_reason)}）→ 整请求直答，tier={result.tier}[/]")
+        return result.text, []
 
     # 规划阶段（分解 + 稍后的汇聚）的耗时单独累计，用于「规划开销值不值」的对照。
     t_plan = time.perf_counter()
@@ -328,6 +365,8 @@ def _record_task(
     total_ms: float,
     plan_ms: float,
     exec_ms: float,
+    gated: int = 0,
+    gate_reason: str | None = None,
     error: str | None = None,
 ) -> None:
     """写一行 tasks。cloud_tokens 来自数据库汇总，不在这里累加。
@@ -356,6 +395,8 @@ def _record_task(
             cloud_tokens=_sum_cloud_tokens(task_id),
             plan_ms=round(plan_ms, 1),
             exec_ms=round(exec_ms, 1),
+            gated=gated,
+            gate_reason=gate_reason,
             error=error,
         )
     )
@@ -544,6 +585,7 @@ def _print_stats(run_id: str | None) -> None:
     console.print(f"[dim]run_id = {escape(run_id) if run_id else '全部批次'}[/]")
 
     _print_task_table(run_id)
+    _print_gate_table(run_id)
     _print_plan_table(run_id)
     _print_role_table(run_id)
 
@@ -596,6 +638,38 @@ def _print_task_table(run_id: str | None) -> None:
             "说明有子任务被降级。**报告里引用「分配」那一列**——"
             "「实际」列在云端不可用时恒为 100%，不反映分配策略。[/]"
         )
+
+
+def _print_gate_table(run_id: str | None) -> None:
+    """表1b：预路由闸门命中情况。
+
+    闸门是本版新增的机制，它的判定直接决定「哪些请求付了规划开销」，
+    所以必须和表1 同屏可见——否则看表1 的人会以为所有 dot 请求都走流水线。
+    """
+    gs = metrics.gate_summary(run_id)
+    if not gs["n_gated"] and not gs["n_pipeline"]:
+        return
+    table = Table(title="表1b 预路由闸门（dot 模式的请求去向）", header_style="bold")
+    table.add_column("去向")
+    table.add_column("请求数", justify="right")
+    table.add_column("云端token", justify="right")
+    table.add_column("耗时合计(ms)", justify="right")
+    table.add_row(
+        "闸门拦下 → 整请求直答",
+        str(gs["n_gated"]),
+        str(gs["gated_cloud_tokens"]),
+        f"{gs['gated_ms_total']:.1f}",
+    )
+    table.add_row(
+        "放行 → 分解流水线",
+        str(gs["n_pipeline"]),
+        str(gs["pipeline_cloud_tokens"]),
+        f"{gs['pipeline_ms_total']:.1f}",
+    )
+    console.print(table)
+    if gs["reasons"]:
+        detail = "；".join(f"{r}×{n}" for r, n in gs["reasons"])
+        console.print(f"[dim]拦下理由：{escape(detail)}[/]")
 
 
 def _print_plan_table(run_id: str | None) -> None:

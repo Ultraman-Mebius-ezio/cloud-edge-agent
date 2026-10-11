@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   cloud_tokens  INTEGER DEFAULT 0,
   plan_ms       REAL,      -- 分解 + 汇聚的耗时
   exec_ms       REAL,      -- 子任务执行耗时
+  gated         INTEGER DEFAULT 0,   -- 1 = 被预路由闸门拦下，未进流水线
+  gate_reason   TEXT,      -- 闸门判定理由，报告里逐题公开
   error         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
@@ -134,7 +136,11 @@ def session(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
 # 免得开发中途改了 schema 之后，老库一 INSERT 就炸 "no such column"。
 _MIGRATIONS = {
     "calls": {"requested_tier": "TEXT"},
-    "tasks": {"n_local_planned": "INTEGER DEFAULT 0"},
+    "tasks": {
+        "n_local_planned": "INTEGER DEFAULT 0",
+        "gated": "INTEGER DEFAULT 0",
+        "gate_reason": "TEXT",
+    },
 }
 
 
@@ -186,6 +192,11 @@ class TaskRecord:
     cloud_tokens: int = 0
     plan_ms: float = 0.0
     exec_ms: float = 0.0
+    # 预路由闸门：1 = 该请求被拦下、未进分解流水线，直接整请求作答。
+    # 不记这两个字段的话，dot 的 n_subtasks 会把「闸门拦下的 0 子任务」和
+    # 「分解失败退化成 1 条」混在一起，事后分不开，SLM 使用率也会被稀释。
+    gated: int = 0
+    gate_reason: str | None = None
     error: str | None = None
     ts: str = ""
 
@@ -205,7 +216,7 @@ class TaskRecord:
 _TASK_COLS = [
     "task_id", "run_id", "ts", "strategy", "question", "answer", "n_subtasks",
     "n_local", "n_local_planned", "total_ms", "cloud_tokens", "plan_ms",
-    "exec_ms", "error",
+    "exec_ms", "gated", "gate_reason", "error",
 ]
 
 
@@ -294,14 +305,31 @@ def call_latency_stats(run_id: str | None = None, db_path: Path | None = None) -
     return out
 
 
-def task_stats(run_id: str | None = None, db_path: Path | None = None) -> dict[str, dict[str, Any]]:
+def task_stats(
+    run_id: str | None = None,
+    db_path: Path | None = None,
+    gated: bool | None = None,
+) -> dict[str, dict[str, Any]]:
     """请求级三指标，按 strategy 分组——**这才是要写进报告的那张表**。
 
     - 完整响应时间：中位数 + P95（申请书明确要求这两个）
     - 云端 token 消耗：请求内所有云端调用的 prompt+completion 之和
     - SLM 使用率：走 local 的子任务数 / 总子任务数
+
+    ``gated`` 用于把预路由闸门拦下的请求分开看：闸门拦下的请求 n_subtasks=0，
+    混在一起会把 SLM 使用率的池化分母冲淡（分母变大、分子不变），
+    从而低估分配器真实的本地化比例。报告需要「含闸门」（用户实际体验）
+    与「仅流水线」（分配策略本身）两个口径，所以这里给一个显式开关。
     """
-    where, args = ("WHERE run_id = ? AND error IS NULL", [run_id]) if run_id else ("WHERE error IS NULL", [])
+    clauses = ["error IS NULL"]
+    args: list[Any] = []
+    if run_id:
+        clauses.append("run_id = ?")
+        args.append(run_id)
+    if gated is not None:
+        clauses.append("gated = ?")
+        args.append(1 if gated else 0)
+    where = "WHERE " + " AND ".join(clauses)
     with session(db_path) as conn:
         rows = list(conn.execute(f"SELECT * FROM tasks {where}", args))
     out: dict[str, dict[str, Any]] = {}
@@ -332,6 +360,44 @@ def task_stats(run_id: str | None = None, db_path: Path | None = None) -> dict[s
             "subtasks_median": round(percentile(sub, 0.50), 1) if sub else 0,
         }
     return out
+
+
+def gate_summary(run_id: str | None = None, db_path: Path | None = None) -> dict[str, Any]:
+    """预路由闸门的命中情况：拦下多少、理由分布、以及两条路径各自的云端 token。
+
+    报告里要回答「闸门值不值」，靠的就是 gated 与 pipeline 两组的云端 token
+    对比——拦下的那批如果走流水线要花多少（可以拿同题 direct 的值参照，
+    但这里给的是闸门实际省下的：被拦下的请求自身消耗）。
+    """
+    clauses, args = ["error IS NULL"], []
+    if run_id:
+        clauses.append("run_id = ?")
+        args.append(run_id)
+    where = "WHERE " + " AND ".join(clauses)
+    with session(db_path) as conn:
+        rows = list(
+            conn.execute(
+                f"SELECT gated, gate_reason, COUNT(*) AS n, "
+                f"SUM(cloud_tokens) AS ct, SUM(total_ms) AS ms "
+                f"FROM tasks {where} GROUP BY gated, gate_reason",
+                args,
+            )
+        )
+    n_gated = sum(r["n"] for r in rows if r["gated"])
+    n_pipe = sum(r["n"] for r in rows if not r["gated"])
+    return {
+        "n_total": n_gated + n_pipe,
+        "n_gated": n_gated,
+        "n_pipeline": n_pipe,
+        "gated_cloud_tokens": int(sum(r["ct"] or 0 for r in rows if r["gated"])),
+        "pipeline_cloud_tokens": int(sum(r["ct"] or 0 for r in rows if not r["gated"])),
+        "gated_ms_total": round(sum(r["ms"] or 0 for r in rows if r["gated"]), 1),
+        "pipeline_ms_total": round(sum(r["ms"] or 0 for r in rows if not r["gated"]), 1),
+        "reasons": sorted(
+            [(r["gate_reason"] or "(未记录)", r["n"]) for r in rows if r["gated"]],
+            key=lambda x: -x[1],
+        ),
+    }
 
 
 def role_summary(
