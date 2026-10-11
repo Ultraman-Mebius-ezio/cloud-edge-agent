@@ -39,6 +39,15 @@ from .llm_client import call_llm, warmup
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODE = "dot"  # 契约默认主方案
+
+# 四种模式。前三条来自申请书的「先实现纯本地、纯云端及规则协同三种模式」，
+# dot 是在此之上加的子任务级分配主方案。
+#   local  —— 纯本地基线（协同收益的下界）
+#   cloud  —— 纯云端基线（申请书写明的对照基准）
+#   direct —— 规则整请求路由（注意：规则路由器，不是强基线）
+#   dot    —— 闸门 + 分解流水线（主方案）
+PURE_TIER_MODES = {"local": "local", "cloud": "cloud"}
+SINGLE_SHOT_MODES = ("local", "cloud", "direct")
 # 执行/汇聚调用的瞬时故障重试次数（契约里 planner/runner/aggregator 均为 2）。
 # 本机 sm_120 冷加载偶发 CUDA 初始化失败，重试能吃掉这类抖动。
 EXEC_RETRIES = 2
@@ -97,9 +106,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("direct", "dot"),
+        choices=("local", "cloud", "direct", "dot"),
         default=DEFAULT_MODE,
-        help="direct = 整请求路由（对照基线）；dot = 子任务级分配（主方案，默认）",
+        help=(
+            "local = 纯本地基线；cloud = 纯云端基线（申请书的对照基准）；"
+            "direct = 规则整请求路由；dot = 闸门+子任务级分配（主方案，默认）"
+        ),
     )
     parser.add_argument(
         "--once",
@@ -190,6 +202,62 @@ def answer_direct(question: str, task_id: str, run_id: str) -> tuple[str, dict[s
     return _direct_impl(question, task_id, run_id, stream=False, on_delta=None, history=None)
 
 
+_MODE_LABEL = {
+    "local": "纯本地基线",
+    "cloud": "纯云端基线",
+    "direct": "规则整请求路由",
+    "dot": "闸门 + 子任务级分配",
+}
+
+
+def _answer_single_shot(
+    question: str,
+    mode: str,
+    task_id: str,
+    run_id: str,
+    *,
+    stream: bool = False,
+    on_delta: Callable[[str], None] | None = None,
+    history: Sequence[tuple[str, str]] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """三种单次作答模式的统一入口：local / cloud / direct。
+
+    三者只差档位来源（强制本地 / 强制云端 / 规则判定），执行与落库同一条路径，
+    这样对照才公平。dot 不走这里（它有分解流水线）。
+    """
+    return _direct_impl(
+        question,
+        task_id,
+        run_id,
+        stream=stream,
+        on_delta=on_delta,
+        history=history,
+        force_tier=PURE_TIER_MODES.get(mode),
+        strategy=mode,
+    )
+
+
+def answer_pure(
+    question: str, tier: str, task_id: str, run_id: str
+) -> tuple[str, dict[str, Any]]:
+    """纯本地 / 纯云端基线：整条请求强制走指定档位，不做任何路由。
+
+    申请书要求「以同任务纯云端大模型为基线」，所以纯云端是一条**必须存在**的
+    对照臂，不是调试开关；纯本地同理，它是「协同到底带来多少收益」的下界。
+    两者与 direct 的差别只在档位来源，执行与落库路径完全一致。
+    """
+    return _direct_impl(
+        question,
+        task_id,
+        run_id,
+        stream=False,
+        on_delta=None,
+        history=None,
+        force_tier=tier,
+        strategy=tier,
+    )
+
+
 def _direct_impl(
     question: str,
     task_id: str,
@@ -198,16 +266,25 @@ def _direct_impl(
     stream: bool,
     on_delta: Callable[[str], None] | None,
     history: Sequence[tuple[str, str]] | None,
+    force_tier: str | None = None,
+    strategy: str = "direct",
 ) -> tuple[str, dict[str, Any]]:
-    """direct 的实际实现。契约签名只暴露 3 个参数，流式与历史仅交互模式内部用。"""
+    """单次作答的实际实现。
+
+    force_tier 非空时**绕过规则路由**，把整条请求强制交给该档位——纯本地与
+    纯云端两条基线走的就是这条路（申请书要求「先实现纯本地、纯云端及规则
+    协同三种模式」）。三者的差别只在「档位怎么来」，执行与落库路径完全一致，
+    这样对照才是公平的。
+    """
     t0 = time.perf_counter()
-    tier = allocator.allocate_one(question)  # ← 规则路由，非学习路由器（见 answer_direct 注释）
+    # 规则路由，非学习路由器（见 answer_direct 注释）。force_tier 用于纯档位基线。
+    tier = force_tier or allocator.allocate_one(question)
     messages = _build_messages(question, history)
     result = call_llm(
         messages=messages,
         role="executor",
         tier=tier,
-        strategy="direct",
+        strategy=strategy,
         task_id=task_id,
         run_id=run_id,
         retries=EXEC_RETRIES,
@@ -218,7 +295,7 @@ def _direct_impl(
     answer = result.text
 
     _record_task(
-        strategy="direct",
+        strategy=strategy,
         task_id=task_id,
         run_id=run_id,
         question=question,
@@ -432,8 +509,8 @@ def _run_once(question: str, mode: str, run_id: str) -> int:
     task_id = _new_task_id()
     console.print(f"[dim]run_id={escape(run_id)}  task_id={task_id}  mode={mode}[/]")
 
-    if mode == "direct":
-        answer, meta = answer_direct(question, task_id, run_id)
+    if mode in SINGLE_SHOT_MODES:
+        answer, meta = _answer_single_shot(question, mode, task_id, run_id)
         _print_answer(answer)
         _print_direct_meta(meta)
     else:
@@ -477,10 +554,11 @@ def _interactive(mode: str, run_id: str) -> int:
 
         task_id = _new_task_id()
         try:
-            if mode == "direct":
-                console.print(Rule("direct · 规则整请求路由"))
-                answer, meta = _direct_impl(
+            if mode in SINGLE_SHOT_MODES:
+                console.print(Rule(f"{mode} · {_MODE_LABEL[mode]}"))
+                answer, meta = _answer_single_shot(
                     question,
+                    mode,
                     task_id,
                     run_id,
                     stream=True,
