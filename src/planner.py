@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import sys
 
+from .config import CONFIG
 from .llm_client import call_llm
 
 # --------------------------------------------------------------------------
@@ -38,8 +39,8 @@ MIN_SUBTASKS = 2
 # 「模型没按格式输出」还是「调用本身就失败了」——这两种要分开归因。
 RAW_TEXT_LOG_CHARS = 500
 
-# 分解调用的固定参数。抽成常量是为了让 CLI/实验脚本一眼看到口径。
-DECOMPOSER_TIER = "cloud"
+# 分解调用的固定参数。档位不写死在这里——它由 CONFIG.planner_tier 决定
+# （默认 cloud，可切 local 做对照），调用时实时读取，见 decompose()。
 DECOMPOSER_STRATEGY = "dot"
 DECOMPOSER_RETRIES = 2
 
@@ -185,7 +186,7 @@ def decompose(question: str, *, task_id: str = "", run_id: str = "default") -> l
                 {"role": "user", "content": _user_prompt(question)},
             ],
             role="decomposer",
-            tier=DECOMPOSER_TIER,
+            tier=CONFIG.planner_tier,
             strategy=DECOMPOSER_STRATEGY,
             task_id=task_id,
             run_id=run_id,

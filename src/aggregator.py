@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sys
 
-from .config import local_prompt_budget
+from .config import CONFIG, local_prompt_budget
 from .llm_client import call_llm
 from .runner import SubtaskResult
 
@@ -32,11 +32,24 @@ MAX_ANSWER_CHARS = 1200
 # 失败原因写进 prompt 的截断长度。异常信息可能很长，但模型只需要知道「这条失败了」。
 MAX_ERROR_CHARS = 200
 
-# 聚合 prompt 的总字符预算。直接拿本地窗口预算（单位 token）当字符上限：
-# 中文场景下 1 字符约 0.5~1 token，用 token 数当字符上限是保守的（宁可少带）。
-# 之所以按「本地窗口」而非「云端窗口」来卡，是因为 tier="cloud" 的请求在云端
-# 未接入时会被 llm_client 降级到本地执行——不按本地窗口保护就会超窗。
-PROMPT_CHAR_BUDGET = max(1024, local_prompt_budget())
+# 聚合 prompt 的字符预算，按**汇聚器实际会跑在哪**来定，分两档：
+#
+# - 本地档（aggregator_tier=local，或云端未接入而会被降级时）：拿本地窗口预算
+#   （单位 token）当字符上限。中文场景 1 字符约 0.5~1 token，用 token 数当字符
+#   上限是保守的（宁可少带）。这一档必须保守，超窗截断不报错，属最难发现的污染。
+# - 云端档：窗口充裕得多，用上面的本地预算会把大量子任务答案白白丢掉——
+#   实测长上下文场景下每条请求都要丢 4~5 条子任务，直接损害汇聚质量。
+LOCAL_PROMPT_CHAR_BUDGET = max(1024, local_prompt_budget())
+CLOUD_PROMPT_CHAR_BUDGET = 48000
+
+
+def _prompt_budget() -> int:
+    """按汇聚器实际执行档位取预算（云可用且请求云端时才放宽）。"""
+    from .config import cloud_ready
+
+    if CONFIG.aggregator_tier == "cloud" and cloud_ready():
+        return CLOUD_PROMPT_CHAR_BUDGET
+    return LOCAL_PROMPT_CHAR_BUDGET
 
 _HEADER = (
     "你是端云协同系统里的汇聚器。下面是针对同一个问题的若干子任务及其答案，"
@@ -87,7 +100,7 @@ def aggregate(
     res = call_llm(
         messages=[{"role": "user", "content": prompt}],
         role="aggregator",
-        tier="cloud",
+        tier=CONFIG.aggregator_tier,
         strategy="dot",
         task_id=task_id,
         run_id=run_id,
@@ -111,10 +124,11 @@ def _build_prompt(question: str, results: list[SubtaskResult]) -> str:
     为什么从最早丢：后面的子任务通常依赖前面的结论，保留靠后的答案信息密度更高，
     而 DoT 的顺序执行里越早的子任务越可能只是铺垫。
     """
+    budget = _prompt_budget()
     dropped: set[int] = set()
     while True:
         prompt = _assemble(question, results, dropped)
-        if len(prompt) <= PROMPT_CHAR_BUDGET:
+        if len(prompt) <= budget:
             break
         nxt = next((i for i in range(len(results)) if i not in dropped), None)
         if nxt is None:
@@ -124,7 +138,7 @@ def _build_prompt(question: str, results: list[SubtaskResult]) -> str:
 
     if dropped:
         print(
-            f"[aggregator] ⚠ 聚合 prompt 超出 {PROMPT_CHAR_BUDGET} 字符预算，"
+            f"[aggregator] ⚠ 聚合 prompt 超出 {budget} 字符预算，"
             f"已省略最早的 {len(dropped)} 条子任务答案",
             file=sys.stderr,
         )

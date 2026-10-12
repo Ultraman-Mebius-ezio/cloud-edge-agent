@@ -64,6 +64,17 @@ class Config:
     # 关闭时：直接返回 error 结果（指标口径最纯净，但无 key 期间 dot 模式不可用）。
     cloud_fallback_local: bool = True
 
+    # 规划链两端的档位（local | cloud），决定「分解」与「汇聚」由谁执行。
+    #
+    # 为什么这是个一等配置项而不是写死：
+    # 实测 dot 的云端 token 有 90%+ 花在分解与汇聚这两笔规划开销上（见实验报告）。
+    # 把它们下沉到本地，dot 的云端消耗即可低于纯云端——这正是端云协同最核心的
+    # 省钱点，也是 DoT §3「原始查询只在边缘模型上做分解和分配」的原意。
+    # 但本地 3B 的分解质量实测偏弱（会产出复述题干的伪子任务），所以默认仍走云端，
+    # 本地档位用于对照实验，量化「省下的 token」与「掉掉的准确率」之间的权衡。
+    planner_tier: str = "cloud"
+    aggregator_tier: str = "cloud"
+
     request_timeout: int = 300
     db_path: Path = ROOT / "runs" / "metrics.db"
     cache_dir: Path = ROOT / "runs" / "cache"
@@ -91,6 +102,8 @@ class Config:
             local_num_ctx=int(_env("LOCAL_NUM_CTX", "16384")),
             local_think=_env("LOCAL_THINK", "0") == "1",
             cloud_fallback_local=_env("CLOUD_FALLBACK_LOCAL", "1") == "1",
+            planner_tier=_env("PLANNER_TIER", "cloud"),
+            aggregator_tier=_env("AGGREGATOR_TIER", "cloud"),
         )
 
 
