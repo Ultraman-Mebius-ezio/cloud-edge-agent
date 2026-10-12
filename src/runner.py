@@ -19,11 +19,13 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from dataclasses import dataclass
+from typing import Any
 
-from . import llm_client
+from . import llm_client, tools
 from .config import CONFIG, cloud_ready, local_prompt_budget
 
 # —— 模块级常量：调用参数与提示词骨架集中在此，避免魔法值散落 ——
@@ -31,6 +33,10 @@ from .config import CONFIG, cloud_ready, local_prompt_budget
 ROLE = "executor"          # 必须在 llm_client.ROLES 里（已登记）
 STRATEGY = "dot"
 DEFAULT_RETRIES = 2        # 本机 sm_120 冷加载偶发 CUDA 初始化失败，靠重试吃掉
+
+# 一个子任务最多允许几轮工具调用。取 2 而不是更多：链式调用会让本地延迟
+# 成倍增长，而实测绝大多数子任务一次求值就够；超出就按当前文本收敛。
+MAX_TOOL_ROUNDS = 2
 
 # 子任务 prompt 结构。骨架照抄接口冻结文档 §2，改动会同时影响 planner 的
 # 提示词设计与预算核算（固定开销是按这份模板实测出来的）。
@@ -137,6 +143,67 @@ def _drop_to_fit(
     return dropped
 
 
+def _run_tool(tc: dict) -> str:
+    """分派一个工具调用。未知工具如实回报，让模型自己改，而不是中断流水线。"""
+    name = tc.get("name")
+    if name != tools.CALC_NAME:
+        return f"未知工具：{name}"
+    try:
+        args = json.loads(tc.get("arguments") or "{}")
+    except Exception:  # noqa: BLE001 - 模型给的参数不合法是常态，如实回报即可
+        return '参数不是合法 JSON，请重新给出 {"expression": "..."}'
+    return tools.calculate(str(args.get("expression", "")))
+
+
+def _tool_exchange(res: llm_client.LLMResult) -> list[dict]:
+    """把「模型的 tool_calls」与「本地求值结果」拼成下一轮要带上的消息。"""
+    assistant = {
+        "role": "assistant",
+        "content": res.text or "",
+        "tool_calls": [
+            {
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+            }
+            for tc in res.tool_calls
+        ],
+    }
+    out = [assistant]
+    for tc in res.tool_calls:
+        out.append({"role": "tool", "tool_call_id": tc["id"], "content": _run_tool(tc)})
+    return out
+
+
+def _execute(messages: list[dict], requested: str, task_id: str, run_id: str) -> tuple[Any, int]:
+    """执行一个子任务，允许它按需调用计算器。返回 (最终结果, 工具轮数)。
+
+    每一轮都走 llm_client.call_llm——**包括工具回灌后的那一轮**。
+    申请书要求「累计所有 API 调用的输入与输出（含重试）」，工具轮也不例外；
+    少记一轮就少算一次输入，且不报错。
+
+    计算器在本地求值，所以这些轮次不产生云端 token——这正是这个工具
+    同时改善准确率与指标一的原因。
+    """
+    use_tools = CONFIG.tools_enabled
+    msgs = list(messages)
+    res = llm_client.call_llm(
+        messages=msgs, role=ROLE, tier=requested, strategy=STRATEGY,
+        task_id=task_id, run_id=run_id, retries=DEFAULT_RETRIES,
+        tools=tools.CALCULATOR_TOOLS if use_tools else None,
+    )
+    rounds = 0
+    while use_tools and res.error is None and res.tool_calls and rounds < MAX_TOOL_ROUNDS:
+        rounds += 1
+        msgs = msgs + _tool_exchange(res)
+        res = llm_client.call_llm(
+            messages=msgs, role=ROLE, tier=requested, strategy=STRATEGY,
+            task_id=task_id, run_id=run_id, retries=DEFAULT_RETRIES,
+            tools=tools.CALCULATOR_TOOLS,
+        )
+    return res, rounds
+
+
 def run(
     subtasks: list[str],
     tiers: list[str],
@@ -192,15 +259,11 @@ def run(
         _emit(f"[{i + 1}/{total}] tier={predicted} 正在执行…")
 
         t0 = time.perf_counter()
-        res = llm_client.call_llm(
-            messages=messages,
-            role=ROLE,
-            tier=requested,
-            strategy=STRATEGY,
-            task_id=task_id,
-            run_id=run_id,
-            retries=DEFAULT_RETRIES,
-        )
+        res, tool_rounds = _execute(messages, requested, task_id, run_id)
+        # 工具轮会让真实耗时变成多轮之和，而 res.latency_ms 只是**最后一轮**的。
+        # 直接用它会低报完整响应时间（尤其本地子任务每轮都要数秒），所以在这里
+        # 单独量一次总耗时，SubtaskResult 记这个。
+        exec_elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         # usage 缺失会让三指标失真，必须让它可见（接口冻结文档第 0 节第 3 条）。
         if res.error is None and res.usage_missing:
@@ -229,17 +292,18 @@ def run(
             answer=res.text if res.error is None else "",
             prompt_tokens=res.prompt_tokens,
             completion_tokens=res.completion_tokens,
-            latency_ms=res.latency_ms,
+            latency_ms=exec_elapsed_ms,
             error=res.error,
         )
         results.append(sr)
 
         # 完成后追加耗时与 token。耗时统一从 latency_ms 取（客户端计时为准）。
         elapsed = sr.latency_ms / 1000.0
+        tool_note = f" tool×{tool_rounds}" if tool_rounds else ""
         if sr.error is None:
             _emit(
                 f"[{i + 1}/{total}] tier={sr.tier} 完成 {elapsed:.1f}s "
-                f"tok {sr.prompt_tokens}+{sr.completion_tokens}"
+                f"tok {sr.prompt_tokens}+{sr.completion_tokens}{tool_note}"
             )
         else:
             _emit(f"[{i + 1}/{total}] tier={sr.tier} 失败 {elapsed:.1f}s: {sr.error}")

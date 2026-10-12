@@ -75,6 +75,14 @@ class Config:
     planner_tier: str = "cloud"
     aggregator_tier: str = "cloud"
 
+    # 子任务执行器是否挂计算器工具。
+    #
+    # 实测动机：8B 模型在一条完全正确的分解链上把最后一步「25 − 22」算成了 1。
+    # 换更大的模型解决不了——3B 与 8B 的端到端准确率实测几乎无差别，因为
+    # LLM 的算术滑动在任何参数量上都会发生。
+    # 计算器在**本地**求值，不产生云端 token，所以它同时改善准确率与指标一。
+    tools_enabled: bool = True
+
     request_timeout: int = 300
     db_path: Path = ROOT / "runs" / "metrics.db"
     cache_dir: Path = ROOT / "runs" / "cache"
@@ -104,6 +112,7 @@ class Config:
             cloud_fallback_local=_env("CLOUD_FALLBACK_LOCAL", "1") == "1",
             planner_tier=_env("PLANNER_TIER", "cloud"),
             aggregator_tier=_env("AGGREGATOR_TIER", "cloud"),
+            tools_enabled=_env("TOOLS_ENABLED", "1") == "1",
         )
 
 

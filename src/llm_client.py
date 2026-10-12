@@ -13,8 +13,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
@@ -186,6 +189,11 @@ def call_llm(
         try:
             if stream:
                 _stream_call(kwargs, result, on_delta, t0)
+            elif effective_tier == "local" and tools:
+                # 本地 + 带工具：litellm 的 ollama_chat provider 不做原生工具调用
+                # （实测四种参数组合下 tool_calls 恒为空，直连 /api/chat 一次就成功），
+                # 所以这条路径直连 Ollama。**仍在 call_llm 内部**，落库与重试不变。
+                _native_ollama_chat(kwargs["messages"], tools, result, t0)
             else:
                 _oneline_call(kwargs, result, t0)
             result.error = None
@@ -235,6 +243,123 @@ _TRANSIENT_MARKERS = (
 def _is_transient(err: str) -> bool:
     low = err.lower()
     return any(m.lower() in low for m in _TRANSIENT_MARKERS)
+
+
+def _ollama_tool_calls(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把 Ollama /api/chat 的 tool_calls 规范成内部统一形状。
+
+    Ollama 的 `arguments` 是**对象**，而 OpenAI（与 litellm 路径）给的是
+    **JSON 字符串**。runner 一律按字符串 json.loads，所以这里必须统一成字符串，
+    否则工具参数会解析失败。
+    """
+    out: list[dict[str, Any]] = []
+    for i, tc in enumerate(raw):
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        out.append({
+            "id": tc.get("id") or f"call_{i}",
+            "name": fn.get("name"),
+            "arguments": args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False),
+        })
+    return out
+
+
+def _to_ollama_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把内部（OpenAI 形状）消息转成 Ollama /api/chat 接受的形状。
+
+    实质差异只有一处：**assistant 的 tool_calls.function.arguments**——
+    OpenAI/litellm 要 JSON **字符串**，Ollama 要 **对象**。实测传字符串直接 400：
+        {"error":"Value looks like object, but can't find closing '}' symbol"}
+    而且错误信息不含字段名，只能靠二分才定位得到（踩过一次）。
+
+    内部统一按 OpenAI 形状存（litellm 路径产出的本来就是字符串），
+    只在发往 Ollama 这一层转换，避免两套表示在代码里到处分叉。
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            tcs: list[dict[str, Any]] = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:  # noqa: BLE001 - 解析不了就送空对象，让它重来
+                        args = {}
+                tcs.append({"function": {"name": fn.get("name"), "arguments": args}})
+            out.append({
+                "role": "assistant",
+                "content": m.get("content") or "",
+                "tool_calls": tcs,
+            })
+        elif role == "tool":
+            # 只留 content：Ollama 按位置对应工具结果，多余的 tool_call_id 无益
+            out.append({"role": "tool", "content": m.get("content") or ""})
+        else:
+            out.append(m)
+    return out
+
+
+def _native_ollama_chat(
+    messages: Sequence[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    result: LLMResult,
+    t0: float,
+) -> None:
+    """直连 Ollama 的 /api/chat（仅用于「本地 + 带工具」）。
+
+    为什么不让 litellm 走这条：litellm 的 ollama_chat provider 判断模型是否支持
+    原生工具调用是靠 `"tools" in template`，对本机模型实际回退成了非原生模式——
+    实测四种参数组合下 tool_calls 恒为空，而直连 /api/chat 一次就返回了 calculator 调用。
+    工具是「把算术从模型手里拿走」的唯一有效手段（实测模型会把 25−22 算成 1，
+    且换 8B 也一样），所以这条通道必须存在。
+
+    token 计数取 Ollama 原生的 prompt_eval_count / eval_count，与 litellm 路径同口径。
+    """
+    body: dict[str, Any] = {
+        "model": CONFIG.local.name.split("/", 1)[-1],
+        "messages": _to_ollama_messages(messages),
+        "stream": False,
+        "think": CONFIG.local_think,
+        "options": {
+            "num_ctx": CONFIG.local_num_ctx,
+            "temperature": CONFIG.temperature,
+            "seed": CONFIG.seed,
+            "num_predict": CONFIG.max_tokens,
+        },
+    }
+    if tools:
+        # 防御性归一化：Ollama 的 tools 必须是数组，传 dict 会 400 且错误信息
+        # 不含字段名。调用方偶有传单个 dict 的情况，在这里兜住比让它 400 好。
+        body["tools"] = tools if isinstance(tools, list) else [tools]
+    req = urllib.request.Request(
+        CONFIG.local.api_base.rstrip("/") + "/api/chat",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CONFIG.request_timeout) as resp:
+            d = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # 把响应体读出来。Ollama 的 400 只说 "Bad Request"，不读 body 根本
+        # 不知道是哪个字段不合法（tools 传成 dict 时就是这样，排查花了不少时间）。
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:  # noqa: BLE001 - 读不到就算了，别把原始错误盖掉
+            pass
+        raise RuntimeError(f"Ollama HTTP {e.code}：{detail or e.reason}") from e
+
+    result.latency_ms = (time.perf_counter() - t0) * 1000
+    msg = d.get("message") or {}
+    result.text = msg.get("content") or ""
+    result.reasoning = msg.get("reasoning") or ""
+    result.tool_calls = _ollama_tool_calls(msg.get("tool_calls") or [])
+    result.prompt_tokens = int(d.get("prompt_eval_count") or 0)
+    result.completion_tokens = int(d.get("eval_count") or 0)
+    result.usage_missing = (result.prompt_tokens == 0 and result.completion_tokens == 0)
 
 
 def _oneline_call(kwargs: dict[str, Any], result: LLMResult, t0: float) -> None:
